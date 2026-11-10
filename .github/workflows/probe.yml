@@ -8,26 +8,20 @@ jobs:
           python3 - <<'PY'
           import json, urllib.request
           H={"User-Agent":"Mozilla/5.0","Accept":"application/json"}
+          B="https://site.api.espn.com/apis/site/v2/sports/basketball/nba/"
           def get(u):
+              with urllib.request.urlopen(urllib.request.Request(u,headers=H),timeout=30) as r: return json.loads(r.read())
+          for rng in ("20261020-20261110","20251021-20260413","20261108"):
               try:
-                  with urllib.request.urlopen(urllib.request.Request(u,headers=H),timeout=25) as r:
-                      return r.status, r.read()
-              except Exception as e:
-                  return str(e), b""
-          s,b=get("https://cdn.nba.com/static/json/staticData/scheduleLeagueV2.json"); print("SCHED",s,len(b))
-          if b:
-              d=json.loads(b)["leagueSchedule"]; print("season",d.get("seasonYear"),"dates",len(d["gameDates"]))
-              gs=[g for gd in d["gameDates"] for g in gd["games"]]
-              print("games",len(gs),"final002",sum(1 for g in gs if g["gameStatus"]==3 and g["gameId"].startswith("002")))
-              print("SAMPLEGAME",json.dumps({k:(v if not isinstance(v,(dict,list)) else "...") for k,v in gs[60].items()})[:900])
-              last=[g["gameId"] for g in gs if g["gameStatus"]==3 and g["gameId"].startswith("002")][-1]
-          else: last="0022600001"
-          for gid in ("0022500001","0022501230",last):
-              s,b=get(f"https://cdn.nba.com/static/json/liveData/boxscore/boxscore_{gid}.json"); print("BOX",gid,s,len(b))
-              if b:
-                  g=json.loads(b)["game"]; print({k:g[k] for k in ("gameId","gameTimeUTC","gameEt","gameStatus") if k in g})
-                  t=g["homeTeam"]; print({k:t[k] for k in ("teamTricode","teamCity","teamName")})
-                  p=t["players"][0]; print("PLAYER",json.dumps({k:v for k,v in p.items() if k!="statistics"})); print("STATS",json.dumps(p["statistics"])[:700])
-          for u in ("https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard","https://stats.nba.com/stats/leaguegamelog?Counter=0&Direction=DESC&LeagueID=00&PlayerOrTeam=P&Season=2026-27&SeasonType=Regular+Season&Sorter=DATE"):
-              s,b=get(u); print("OTHER",u[:60],s,len(b))
+                  d=get(B+f"scoreboard?dates={rng}&limit=1500"); ev=d["events"]
+                  print("SB",rng,len(ev),[ (e["id"],e["date"],e["season"],e["status"]["type"]["completed"]) for e in ev[:2]], ev[-1]["date"])
+              except Exception as e: print("SB",rng,"ERR",e)
+          d=get(B+"scoreboard?dates=20261108"); eid=d["events"][0]["id"]
+          e=d["events"][0]; print("EV",json.dumps({k:(v if not isinstance(v,(dict,list)) else "...") for k,v in e.items()}), [c["team"]["displayName"] for c in e["competitions"][0]["competitors"]])
+          s=get(B+f"summary?event={eid}"); bp=s["boxscore"]["players"]
+          for t in bp:
+              print("TEAM",json.dumps(t["team"])[:300]); st=t["statistics"][0]
+              print("KEYS",[k for k in st.keys()], st.get("names"), st.get("labels"), st.get("keys"))
+              for a in st["athletes"][:2]+st["athletes"][-2:]: print("ATH",json.dumps({k:(v if k!="athlete" else {x:v[x] for x in ("id","displayName") if x in v}) for k,v in a.items()})[:500])
+          print("HDR",json.dumps(s["header"]["competitions"][0].get("date")), s["header"].get("season"))
           PY
