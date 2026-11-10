@@ -234,8 +234,25 @@ def fetch_odds_sgo(key, force=False):
         if c is not None:
             return c["events"], c["quota"]
     q = urllib.parse.urlencode({"leagueID": "NBA", "oddsAvailable": "true", "limit": 30})
-    data, _ = http_json("https://api.sportsgameodds.com/v2/events?" + q,
-                        {"x-api-key": key, "Accept": "application/json", "User-Agent": "props-model/1.0"})
+    hdr = {"x-api-key": key, "Accept": "application/json", "User-Agent": "props-model/1.0"}
+    url = "https://api.sportsgameodds.com/v2/events?" + q
+    try:
+        data, _ = http_json(url, hdr)
+    except RuntimeError as e:
+        if "HTTP 429" not in str(e):
+            raise
+        usage = "usage unavailable"
+        try:                                        # this endpoint does not count against limits
+            u, _ = http_json("https://api.sportsgameodds.com/v2/account/usage", hdr)
+            d = u.get("data") or {}
+            usage = json.dumps({"tier": d.get("tier"), "rateLimits": d.get("rateLimits")})
+        except Exception as ue:
+            usage = f"usage check failed: {ue}"
+        time.sleep(65)                              # per-minute limits reset; monthly ones will not
+        try:
+            data, _ = http_json(url, hdr)
+        except RuntimeError:
+            raise RuntimeError(f"SportsGameOdds rate limit hit. Account usage: {usage}")
     now = datetime.now(timezone.utc)
     out, seen_stats, raw = [], set(), data.get("data") or []
     for ev in raw:
