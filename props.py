@@ -2,7 +2,7 @@
 """
 NBA player prop model + local dashboard.  Standard library only.
 
-  export ODDS_API_KEY=your_key        (The Odds API, the-odds-api.com)
+  export ODDS_API_KEY=your_key        (SportsGameOdds by default; --provider theoddsapi for The Odds API)
   python3 props.py                    -> open http://localhost:8000
   python3 props.py --demo             -> fake data, no key, no API credits
   python3 props.py --host 0.0.0.0     -> also reachable from your phone on the same Wi-Fi
@@ -12,7 +12,7 @@ Pipeline
   1. Box scores for this season and last (ESPN, cached on disk; first run takes a minute).
   2. Projection = projected minutes x per-minute rate x opponent factor.
   3. Negative-binomial distribution around the projection -> P(over), P(under), P(push).
-  4. Prop lines from The Odds API -> no-vig market probability, best price per side.
+  4. Prop lines from the odds provider -> no-vig market probability, best price per side.
   5. Dashboard blends model and market probability and ranks bets by expected value.
 """
 import argparse, gzip, json, math, os, random, re, threading, time, unicodedata
@@ -206,6 +206,89 @@ def fetch_odds(key, force=False):
         out.append(data)
     cache_write("odds.json", {"events": out, "quota": quota})
     return out, quota
+
+
+SGO_STATS = {"points": "player_points", "rebounds": "player_rebounds", "assists": "player_assists",
+             "threePointersMade": "player_threes",
+             "points+rebounds+assists": "player_points_rebounds_assists"}
+SGO_SKIP_BOOKS = {"prizepicks", "underdog", "sleeper", "parlayplay", "betr", "dabble", "unknown"}  # DFS apps, not prices
+DEBUG = {}
+
+
+def _player_name(ev, pid):
+    p = (ev.get("players") or {}).get(pid) or {}
+    name = p.get("name") or " ".join(x for x in (p.get("firstName"), p.get("lastName")) if x)
+    if name:
+        return name
+    parts = pid.split("_")
+    while parts and (parts[-1].isdigit() or parts[-1].isupper() and len(parts[-1]) <= 5 and len(parts) > 2
+                     and parts[-2].isdigit()):
+        parts.pop()
+    return " ".join(parts).title()
+
+
+def fetch_odds_sgo(key, force=False):
+    """Upcoming NBA events from SportsGameOdds, reshaped to the bookmakers/markets/outcomes layout."""
+    if not force:
+        c = cache_read("odds_sgo.json", ODDS_TTL)
+        if c is not None:
+            return c["events"], c["quota"]
+    q = urllib.parse.urlencode({"leagueID": "NBA", "oddsAvailable": "true", "limit": 30})
+    data, _ = http_json("https://api.sportsgameodds.com/v2/events?" + q,
+                        {"x-api-key": key, "Accept": "application/json", "User-Agent": "props-model/1.0"})
+    now = datetime.now(timezone.utc)
+    out, seen_stats, raw = [], set(), data.get("data") or []
+    for ev in raw:
+        st = ev.get("status") or {}
+        try:
+            t = datetime.fromisoformat(str(st.get("startsAt")).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if not (now < t < now + timedelta(hours=LOOKAHEAD_HOURS)) or st.get("started") or st.get("cancelled"):
+            continue
+        books = defaultdict(lambda: defaultdict(list))            # book -> market -> outcomes
+        for odd in (ev.get("odds") or {}).values():
+            pid = odd.get("playerID") or ""
+            if not pid or pid in ("all", "home", "away") or odd.get("periodID") != "game" \
+                    or odd.get("betTypeID") != "ou":
+                continue
+            seen_stats.add(odd.get("statID"))
+            mkey = SGO_STATS.get(odd.get("statID"))
+            side = odd.get("sideID")
+            if not mkey or side not in ("over", "under"):
+                continue
+            player = _player_name(ev, pid)
+            for bk, b in (odd.get("byBookmaker") or {}).items():
+                if bk in SGO_SKIP_BOOKS or b.get("available") is False:
+                    continue
+                try:
+                    price, point = int(str(b["odds"]).replace("+", "")), float(b["overUnder"])
+                except (KeyError, ValueError, TypeError):
+                    continue
+                if price == 0:
+                    continue
+                books[bk][mkey].append({"name": side.title(), "description": player,
+                                        "price": price, "point": point})
+        tm = ev.get("teams") or {}
+        nm = lambda side: ((tm.get(side) or {}).get("names") or {}).get("long") or ""
+        out.append({"id": ev.get("eventID"), "commence_time": t.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "home_team": nm("home"), "away_team": nm("away"),
+                    "bookmakers": [{"key": bk, "title": bk, "markets": [{"key": k, "outcomes": o}
+                                                                        for k, o in m.items()]}
+                                   for bk, m in books.items()]})
+    DEBUG.update(raw_events=len(raw), kept=len(out), player_ou_stats=sorted(x for x in seen_stats if x),
+                 books=sorted({b["key"] for e in out for b in e["bookmakers"]}),
+                 games=[f"{e['away_team']} @ {e['home_team']}" for e in out])
+    if raw and not out:
+        e0 = raw[0]
+        DEBUG["sample_status"] = e0.get("status")
+        DEBUG["sample_keys"] = sorted(e0.keys())
+    if raw and not any(e["bookmakers"] for e in out):
+        e0 = raw[0]
+        DEBUG["sample_odd"] = next(iter((e0.get("odds") or {}).values()), None)
+        DEBUG["sample_teams"] = e0.get("teams")
+    cache_write("odds_sgo.json", {"events": out, "quota": {}})
+    return out, {}
 
 
 # ----------------------------------------------------------------- model
@@ -407,7 +490,7 @@ def demo_data():
 
 
 # ----------------------------------------------------------------- server
-STATE = {"key": None, "demo": False}
+STATE = {"key": None, "demo": False, "provider": "sgo"}
 LOCK = threading.Lock()
 
 
@@ -428,7 +511,8 @@ def build_payload(force=False):
             logs += fetch_gamelog(f"{y - 1}-{y % 100:02d}")
         except Exception as e:
             notes.append(f"Last season's logs unavailable ({e}); projections use this season only.")
-        events, quota = fetch_odds(STATE["key"], force)
+        fetch = fetch_odds_sgo if STATE["provider"] == "sgo" else fetch_odds
+        events, quota = fetch(STATE["key"], force)
         if not events:
             notes.append(f"No NBA games with odds in the next {LOOKAHEAD_HOURS} hours.")
     model = Model(logs, cur)
@@ -557,10 +641,12 @@ def main():
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--demo", action="store_true", help="synthetic data, no network")
+    ap.add_argument("--provider", default=os.environ.get("ODDS_PROVIDER", "sgo"), choices=["sgo", "theoddsapi"],
+                    help="odds source: SportsGameOdds (default) or The Odds API")
     ap.add_argument("--build", metavar="DIR", help="write a static index.html to DIR and exit")
     a = ap.parse_args()
     a.key = (a.key or "").strip() or None
-    STATE.update(key=a.key, demo=a.demo)
+    STATE.update(key=a.key, demo=a.demo, provider=a.provider)
     if a.build:
         try:
             payload = build_payload(force=True)
@@ -571,6 +657,8 @@ def main():
         with open(os.path.join(a.build, "index.html"), "w") as f:
             f.write(PAGE.replace("/*DATA*/null", blob))
         print(f"Wrote {a.build}/index.html: {payload['games']} games, {len(payload['rows'])} lines")
+        print("DEBUG", json.dumps(DEBUG, default=str)[:3000])
+        print("NOTES", payload["notes"])
         return
     print(f"NBA props dashboard: http://{'localhost' if a.host == '127.0.0.1' else a.host}:{a.port}"
           + ("  (demo data)" if a.demo else ""))
