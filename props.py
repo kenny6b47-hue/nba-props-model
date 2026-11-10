@@ -559,6 +559,7 @@ def main():
     ap.add_argument("--demo", action="store_true", help="synthetic data, no network")
     ap.add_argument("--build", metavar="DIR", help="write a static index.html to DIR and exit")
     a = ap.parse_args()
+    a.key = (a.key or "").strip() or None
     STATE.update(key=a.key, demo=a.demo)
     if a.build:
         try:
