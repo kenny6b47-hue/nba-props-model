@@ -1,0 +1,33 @@
+name: Probe
+on: workflow_dispatch
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          python3 - <<'PY'
+          import json, urllib.request
+          H={"User-Agent":"Mozilla/5.0","Accept":"application/json"}
+          def get(u):
+              try:
+                  with urllib.request.urlopen(urllib.request.Request(u,headers=H),timeout=25) as r:
+                      return r.status, r.read()
+              except Exception as e:
+                  return str(e), b""
+          s,b=get("https://cdn.nba.com/static/json/staticData/scheduleLeagueV2.json"); print("SCHED",s,len(b))
+          if b:
+              d=json.loads(b)["leagueSchedule"]; print("season",d.get("seasonYear"),"dates",len(d["gameDates"]))
+              gs=[g for gd in d["gameDates"] for g in gd["games"]]
+              print("games",len(gs),"final002",sum(1 for g in gs if g["gameStatus"]==3 and g["gameId"].startswith("002")))
+              print("SAMPLEGAME",json.dumps({k:(v if not isinstance(v,(dict,list)) else "...") for k,v in gs[60].items()})[:900])
+              last=[g["gameId"] for g in gs if g["gameStatus"]==3 and g["gameId"].startswith("002")][-1]
+          else: last="0022600001"
+          for gid in ("0022500001","0022501230",last):
+              s,b=get(f"https://cdn.nba.com/static/json/liveData/boxscore/boxscore_{gid}.json"); print("BOX",gid,s,len(b))
+              if b:
+                  g=json.loads(b)["game"]; print({k:g[k] for k in ("gameId","gameTimeUTC","gameEt","gameStatus") if k in g})
+                  t=g["homeTeam"]; print({k:t[k] for k in ("teamTricode","teamCity","teamName")})
+                  p=t["players"][0]; print("PLAYER",json.dumps({k:v for k,v in p.items() if k!="statistics"})); print("STATS",json.dumps(p["statistics"])[:700])
+          for u in ("https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard","https://stats.nba.com/stats/leaguegamelog?Counter=0&Direction=DESC&LeagueID=00&PlayerOrTeam=P&Season=2026-27&SeasonType=Regular+Season&Sorter=DATE"):
+              s,b=get(u); print("OTHER",u[:60],s,len(b))
+          PY
