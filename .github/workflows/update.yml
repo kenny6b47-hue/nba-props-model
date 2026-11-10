@@ -28,8 +28,8 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: cache
-          key: gamelog-${{ github.run_id }}
-          restore-keys: gamelog-
+          key: stats-${{ github.run_id }}
+          restore-keys: stats-
       - name: Run model
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}

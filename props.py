@@ -9,7 +9,7 @@ NBA player prop model + local dashboard.  Standard library only.
   python3 props.py --build site       -> write a static site/index.html (used by the GitHub workflow)
 
 Pipeline
-  1. Game logs for this season and last (stats.nba.com, one call per season, cached).
+  1. Box scores for this season and last (ESPN, cached on disk; first run takes a minute).
   2. Projection = projected minutes x per-minute rate x opponent factor.
   3. Negative-binomial distribution around the projection -> P(over), P(under), P(push).
   4. Prop lines from The Odds API -> no-vig market probability, best price per side.
@@ -41,18 +41,6 @@ LOOKAHEAD_HOURS = 30     # which upcoming games to pull props for
 ODDS_TTL = 600           # seconds; each refresh costs credits (markets x regions per game)
 STATS_TTL = 6 * 3600
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
-
-NBA_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.5",
-    "Accept-Encoding": "gzip",
-    "Referer": "https://www.nba.com/",
-    "Origin": "https://www.nba.com",
-    "Pragma": "no-cache",
-    "Cache-Control": "no-cache",
-}
 
 
 # ----------------------------------------------------------------- helpers
@@ -114,39 +102,85 @@ def dec_odds(american):
     return 1 + (american / 100 if american > 0 else 100 / -american)
 
 
-# ----------------------------------------------------------------- data: NBA
-def fetch_gamelog(season):
-    """All player box-score lines for one regular season, as a list of dicts."""
-    name = f"gamelog_{season}.json"
-    current = season == season_str(datetime.now())
-    rows = cache_read(name, STATS_TTL if current else 30 * 86400)
-    if rows is not None:
-        return rows
-    q = urllib.parse.urlencode({
-        "Counter": 0, "DateFrom": "", "DateTo": "", "Direction": "DESC", "LeagueID": "00",
-        "PlayerOrTeam": "P", "Season": season, "SeasonType": "Regular Season", "Sorter": "DATE"})
-    try:
-        data, _ = http_json("https://stats.nba.com/stats/leaguegamelog?" + q, NBA_HEADERS)
-    except Exception:
-        stale = cache_read(name)                    # stats.nba.com is flaky: fall back
-        if stale is not None:
-            return stale
-        raise
-    rs = data["resultSets"][0]
-    ix = {h: i for i, h in enumerate(rs["headers"])}
+# ----------------------------------------------------------------- data: box scores (ESPN)
+ESPN = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/"
+ESPN_HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+
+
+def _espn_day(day):
+    """Completed regular-season games on one date -> [(event_id, season_year)]."""
+    data, _ = http_json(f"{ESPN}scoreboard?dates={day}", ESPN_HEADERS, timeout=30)
+    return [(e["id"], e["season"]["year"]) for e in data.get("events", [])
+            if e["season"].get("type") == 2 and e["status"]["type"].get("completed")]
+
+
+def _espn_box(eid, season):
+    """One game's box score -> list of player rows."""
+    data, _ = http_json(f"{ESPN}summary?event={eid}", ESPN_HEADERS, timeout=30)
+    date = data["header"]["competitions"][0]["date"][:10]
     rows = []
-    for r in rs["rowSet"]:
-        mins = r[ix["MIN"]]
-        if not mins:
-            continue
-        rows.append({
-            "season": season, "pid": r[ix["PLAYER_ID"]], "name": r[ix["PLAYER_NAME"]],
-            "team": r[ix["TEAM_ABBREVIATION"]], "team_name": r[ix["TEAM_NAME"]],
-            "gid": r[ix["GAME_ID"]], "date": r[ix["GAME_DATE"]][:10], "matchup": r[ix["MATCHUP"]],
-            "MIN": float(mins), "PTS": r[ix["PTS"]] or 0, "REB": r[ix["REB"]] or 0,
-            "AST": r[ix["AST"]] or 0, "FG3M": r[ix["FG3M"]] or 0})
-    cache_write(name, rows)
+    for t in data.get("boxscore", {}).get("players", []):
+        st = t["statistics"][0]
+        ix = {k: i for i, k in enumerate(st.get("labels") or st["names"])}
+        for a in st["athletes"]:
+            v = a.get("stats") or []
+            if a.get("didNotPlay") or len(v) <= max(ix.values()):
+                continue
+            try:
+                mins = float(v[ix["MIN"]])
+                row = {"season": season, "pid": a["athlete"]["id"], "name": a["athlete"]["displayName"],
+                       "team": t["team"]["abbreviation"], "team_name": t["team"]["displayName"],
+                       "gid": eid, "date": date, "matchup": "", "MIN": mins,
+                       "PTS": int(v[ix["PTS"]]), "REB": int(v[ix["REB"]]), "AST": int(v[ix["AST"]]),
+                       "FG3M": int(v[ix["3PT"]].split("-")[0])}
+            except (ValueError, KeyError):
+                continue
+            if mins > 0:
+                rows.append(row)
     return rows
+
+
+def fetch_gamelog(season):
+    """All player box-score lines for one regular season, as a list of dicts.
+
+    Walks ESPN's daily scoreboards and per-game box scores, keeping everything on disk so
+    each run only fetches games it has not seen (the first run pulls a full prior season).
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    name = f"espn_{season}.json"
+    y = int(season[:4])
+    today = datetime.now().date()
+    c = cache_read(name) or {"days": {}, "games": {}, "done": False}
+    fresh = os.path.exists(cache_path(name)) and time.time() - os.path.getmtime(cache_path(name)) < STATS_TTL
+    if not (c["done"] or (fresh and c["games"])):
+        start, end = datetime(y, 10, 15).date(), min(today, datetime(y + 1, 4, 20).date())
+        days = [(start + timedelta(days=i)) for i in range((end - start).days + 1)]
+        need = [d.strftime("%Y%m%d") for d in days
+                if d.strftime("%Y%m%d") not in c["days"] or (today - d).days <= 2]
+        with ThreadPoolExecutor(12) as ex:
+            for d, res in zip(need, ex.map(lambda d: _safe(_espn_day, d), need)):
+                if res is not None:
+                    c["days"][d] = [eid for eid, yr in res if yr == y + 1]
+            todo = sorted({e for ids in c["days"].values() for e in ids} - set(c["games"]))
+            got = list(ex.map(lambda e: _safe(_espn_box, e, season), todo))
+        failed = 0
+        for eid, rows in zip(todo, got):
+            if rows:
+                c["games"][eid] = rows
+            else:
+                failed += 1
+        if todo and failed > max(3, len(todo) // 10) and not c["games"]:
+            raise RuntimeError(f"ESPN box scores unavailable ({failed}/{len(todo)} failed)")
+        c["done"] = today > datetime(y + 1, 4, 20).date() and failed == 0 and len(c["days"]) >= len(days)
+        cache_write(name, c)
+    return [dict(r) for rows in c["games"].values() for r in rows]
+
+
+def _safe(fn, *a):
+    try:
+        return fn(*a)
+    except Exception:
+        return None
 
 
 # ----------------------------------------------------------------- data: odds
