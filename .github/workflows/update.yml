@@ -33,7 +33,13 @@ jobs:
       - name: Run model
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
-        run: python props.py --build site
+          THE_ODDS_API_KEY: ${{ secrets.THE_ODDS_API_KEY }}
+        run: |
+          if [ -n "$THE_ODDS_API_KEY" ]; then
+            ODDS_API_KEY="$THE_ODDS_API_KEY" python props.py --provider theoddsapi --build site
+          else
+            python props.py --build site
+          fi
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
